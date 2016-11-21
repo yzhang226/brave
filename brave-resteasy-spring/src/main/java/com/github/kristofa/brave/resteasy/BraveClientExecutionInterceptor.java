@@ -1,17 +1,25 @@
 package com.github.kristofa.brave.resteasy;
 
+import com.github.kristofa.brave.Brave;
+import com.github.kristofa.brave.ClientRequestAdapter;
+import com.github.kristofa.brave.ClientRequestInterceptor;
+import com.github.kristofa.brave.ClientResponseAdapter;
+import com.github.kristofa.brave.ClientResponseInterceptor;
+import com.github.kristofa.brave.ClientTracer;
+import com.github.kristofa.brave.NoAnnotationsClientResponseAdapter;
+import com.github.kristofa.brave.TagExtractor;
+import com.github.kristofa.brave.http.HttpClientRequestAdapter;
+import com.github.kristofa.brave.http.HttpClientResponseAdapter;
+import com.github.kristofa.brave.http.SpanNameProvider;
 import javax.ws.rs.ext.Provider;
-
-import com.github.kristofa.brave.*;
-import com.github.kristofa.brave.http.*;
-
 import org.jboss.resteasy.annotations.interception.ClientInterceptor;
 import org.jboss.resteasy.client.ClientRequest;
 import org.jboss.resteasy.client.ClientResponse;
 import org.jboss.resteasy.spi.interception.ClientExecutionContext;
 import org.jboss.resteasy.spi.interception.ClientExecutionInterceptor;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
+
+import static com.github.kristofa.brave.internal.Util.checkNotNull;
 
 /**
  * {@link ClientExecutionInterceptor} that uses the {@link ClientTracer} to set up a new span. </p> It adds the necessary
@@ -35,14 +43,67 @@ import org.springframework.stereotype.Component;
  *
  * @author kristof
  */
-@Component
 @Provider
 @ClientInterceptor
 public class BraveClientExecutionInterceptor implements ClientExecutionInterceptor {
 
+    @Autowired // internal
+    BraveClientExecutionInterceptor(SpanNameProvider spanNameProvider, Brave brave) {
+      this(builder().spanNameProvider(spanNameProvider), brave);
+    }
+
+    /** Creates a tracing filter with defaults. Use {@link #builder()} to customize. */
+    public static BraveClientExecutionInterceptor create(Brave brave) {
+        return new Builder().build(brave);
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    public final static class Builder implements TagExtractor.Config<Builder> {
+        final HttpClientRequestAdapter.FactoryBuilder requestFactoryBuilder
+            = HttpClientRequestAdapter.factoryBuilder();
+        final HttpClientResponseAdapter.FactoryBuilder responseFactoryBuilder
+            = HttpClientResponseAdapter.factoryBuilder();
+
+        public Builder spanNameProvider(SpanNameProvider spanNameProvider) {
+            requestFactoryBuilder.spanNameProvider(spanNameProvider);
+            return this;
+        }
+
+        @Override public Builder addKey(String key) {
+            requestFactoryBuilder.addKey(key);
+            responseFactoryBuilder.addKey(key);
+            return this;
+        }
+
+        @Override
+        public Builder addValueParserFactory(TagExtractor.ValueParserFactory factory) {
+            requestFactoryBuilder.addValueParserFactory(factory);
+            responseFactoryBuilder.addValueParserFactory(factory);
+            return this;
+        }
+
+        public BraveClientExecutionInterceptor build(Brave brave) {
+            return new BraveClientExecutionInterceptor(this, checkNotNull(brave, "brave"));
+        }
+
+        Builder() { // intentionally hidden
+        }
+    }
+
+    BraveClientExecutionInterceptor(Builder b, Brave brave) { // intentionally hidden
+        this.requestInterceptor = brave.clientRequestInterceptor();
+        this.responseInterceptor = brave.clientResponseInterceptor();
+        this.requestAdapterFactory = b.requestFactoryBuilder.build(RestEasyHttpClientRequest.class);
+        this.responseAdapterFactory = b.responseFactoryBuilder.build(RestEasyHttpClientResponse.class);
+    }
+
     private final ClientRequestInterceptor requestInterceptor;
     private final ClientResponseInterceptor responseInterceptor;
-    private final SpanNameProvider spanNameProvider;
+    private final ClientRequestAdapter.Factory<RestEasyHttpClientRequest> requestAdapterFactory;
+    private final ClientResponseAdapter.Factory<RestEasyHttpClientResponse> responseAdapterFactory;
 
     /**
      * Create a new instance.
@@ -50,12 +111,15 @@ public class BraveClientExecutionInterceptor implements ClientExecutionIntercept
      * @param spanNameProvider Provides span name.
      * @param requestInterceptor Client request interceptor.
      * @param responseInterceptor Client response interceptor.
+     * @deprecated please use {@link #create(Brave)} or {@link #builder()}
      */
-    @Autowired
+    @Deprecated
     public BraveClientExecutionInterceptor(SpanNameProvider spanNameProvider, ClientRequestInterceptor requestInterceptor, ClientResponseInterceptor responseInterceptor) {
         this.requestInterceptor = requestInterceptor;
-        this.spanNameProvider = spanNameProvider;
         this.responseInterceptor = responseInterceptor;
+        Builder builder = builder().spanNameProvider(spanNameProvider);
+        this.requestAdapterFactory = builder.requestFactoryBuilder.build(RestEasyHttpClientRequest.class);
+        this.responseAdapterFactory = builder.responseFactoryBuilder.build(RestEasyHttpClientResponse.class);
     }
 
     /**
@@ -66,9 +130,9 @@ public class BraveClientExecutionInterceptor implements ClientExecutionIntercept
 
         final ClientRequest request = ctx.getRequest();
 
-        final HttpClientRequest httpClientRequest = new RestEasyHttpClientRequest(request);
-        final ClientRequestAdapter adapter = new HttpClientRequestAdapter(httpClientRequest, spanNameProvider);
-        requestInterceptor.handle(adapter);
+        ClientRequestAdapter requestAdapter =
+            requestAdapterFactory.create(new RestEasyHttpClientRequest(request));
+        requestInterceptor.handle(requestAdapter);
 
         ClientResponse<?> response = null;
         try {
@@ -79,8 +143,8 @@ public class BraveClientExecutionInterceptor implements ClientExecutionIntercept
         finally
         {
             if (response != null) {
-                final HttpResponse httpResponse = new RestEasyHttpClientResponse(response);
-                final ClientResponseAdapter responseAdapter = new HttpClientResponseAdapter(httpResponse);
+                ClientResponseAdapter responseAdapter =
+                    responseAdapterFactory.create(new RestEasyHttpClientResponse(response));
                 responseInterceptor.handle(responseAdapter);
             }
             else

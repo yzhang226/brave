@@ -1,6 +1,8 @@
 package com.github.kristofa.brave.resteasy;
 
-import java.util.logging.Logger;
+import com.github.kristofa.brave.Brave;
+import com.github.kristofa.brave.ServerResponseAdapter;
+import com.github.kristofa.brave.TagExtractor;
 
 import javax.ws.rs.ext.Provider;
 
@@ -11,9 +13,9 @@ import org.jboss.resteasy.annotations.interception.ServerInterceptor;
 import org.jboss.resteasy.core.ServerResponse;
 import org.jboss.resteasy.spi.interception.PostProcessInterceptor;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
 
 import com.github.kristofa.brave.ServerTracer;
+import org.springframework.stereotype.Component;
 
 import static com.github.kristofa.brave.internal.Util.checkNotNull;
 
@@ -27,18 +29,61 @@ import static com.github.kristofa.brave.internal.Util.checkNotNull;
 @ServerInterceptor
 public class BravePostProcessInterceptor implements PostProcessInterceptor {
 
-    private final static Logger LOGGER = Logger.getLogger(BravePostProcessInterceptor.class.getName());
+    @Autowired
+    BravePostProcessInterceptor(Brave brave) {
+        this(builder(), brave);
+    }
 
-    private final ServerResponseInterceptor respInterceptor;
+    /** Creates a tracing interceptor with defaults. Use {@link #builder()} to customize. */
+    public static BravePostProcessInterceptor create(Brave brave) {
+        return new Builder().build(brave);
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    public final static class Builder implements TagExtractor.Config<Builder> {
+        final HttpServerResponseAdapter.FactoryBuilder responseFactoryBuilder
+            = HttpServerResponseAdapter.factoryBuilder();
+
+        @Override public Builder addKey(String key) {
+            responseFactoryBuilder.addKey(key);
+            return this;
+        }
+
+        @Override
+        public Builder addValueParserFactory(TagExtractor.ValueParserFactory factory) {
+            responseFactoryBuilder.addValueParserFactory(factory);
+            return this;
+        }
+
+        public BravePostProcessInterceptor build(Brave brave) {
+            return new BravePostProcessInterceptor(this, checkNotNull(brave, "brave"));
+        }
+
+        Builder() { // intentionally hidden
+        }
+    }
+
+    BravePostProcessInterceptor(Builder b, Brave brave) { // intentionally hidden
+        this.responseInterceptor = brave.serverResponseInterceptor();
+        this.responseAdapterFactory = b.responseFactoryBuilder.build(HttpResponse.class);
+    }
+
+    private final ServerResponseInterceptor responseInterceptor;
+    private final ServerResponseAdapter.Factory<HttpResponse> responseAdapterFactory;
 
     /**
      * Creates a new instance.
      * 
      * @param respInterceptor {@link ServerTracer}. Should not be null.
+     * @deprecated please use {@link #create(Brave)} or {@link #builder()}
      */
-    @Autowired
+    @Deprecated
     public BravePostProcessInterceptor(ServerResponseInterceptor respInterceptor) {
-        this.respInterceptor = respInterceptor;
+        this.responseInterceptor = respInterceptor;
+        this.responseAdapterFactory = builder().responseFactoryBuilder.build(HttpResponse.class);
     }
 
     @Override
@@ -51,8 +96,8 @@ public class BravePostProcessInterceptor implements PostProcessInterceptor {
                 return response.getStatus();
             }
         };
-        HttpServerResponseAdapter adapter = new HttpServerResponseAdapter(httpResponse);
-        respInterceptor.handle(adapter);
+        ServerResponseAdapter adapter = responseAdapterFactory.create(httpResponse);
+        responseInterceptor.handle(adapter);
     }
 
 }

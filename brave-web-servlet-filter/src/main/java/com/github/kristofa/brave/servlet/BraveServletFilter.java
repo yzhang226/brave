@@ -1,12 +1,16 @@
 package com.github.kristofa.brave.servlet;
 
+import com.github.kristofa.brave.Brave;
+import com.github.kristofa.brave.ServerRequestAdapter;
 import com.github.kristofa.brave.ServerRequestInterceptor;
+import com.github.kristofa.brave.ServerResponseAdapter;
 import com.github.kristofa.brave.ServerResponseInterceptor;
+import com.github.kristofa.brave.TagExtractor;
 import com.github.kristofa.brave.http.HttpResponse;
 import com.github.kristofa.brave.http.HttpServerRequestAdapter;
 import com.github.kristofa.brave.http.HttpServerResponseAdapter;
 import com.github.kristofa.brave.http.SpanNameProvider;
-
+import java.io.IOException;
 import javax.servlet.Filter;
 import javax.servlet.FilterChain;
 import javax.servlet.FilterConfig;
@@ -16,7 +20,8 @@ import javax.servlet.ServletResponse;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import javax.servlet.http.HttpServletResponseWrapper;
-import java.io.IOException;
+
+import static com.github.kristofa.brave.internal.Util.checkNotNull;
 
 /**
  * Servlet filter that will extract trace headers from the request and send
@@ -24,16 +29,71 @@ import java.io.IOException;
  */
 public class BraveServletFilter implements Filter {
 
+    /** Creates a tracing filter with defaults. Use {@link #builder()} to customize. */
+    public static BraveServletFilter create(Brave brave) {
+        return new Builder().build(brave);
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    public final static class Builder implements TagExtractor.Config<Builder> {
+        final HttpServerRequestAdapter.FactoryBuilder requestFactoryBuilder
+            = HttpServerRequestAdapter.factoryBuilder();
+        final HttpServerResponseAdapter.FactoryBuilder responseFactoryBuilder
+            = HttpServerResponseAdapter.factoryBuilder();
+
+        public Builder spanNameProvider(SpanNameProvider spanNameProvider) {
+            requestFactoryBuilder.spanNameProvider(spanNameProvider);
+            return this;
+        }
+
+        @Override public Builder addKey(String key) {
+            requestFactoryBuilder.addKey(key);
+            responseFactoryBuilder.addKey(key);
+            return this;
+        }
+
+        @Override
+        public Builder addValueParserFactory(TagExtractor.ValueParserFactory factory) {
+            requestFactoryBuilder.addValueParserFactory(factory);
+            responseFactoryBuilder.addValueParserFactory(factory);
+            return this;
+        }
+
+        public BraveServletFilter build(Brave brave) {
+            return new BraveServletFilter(this, checkNotNull(brave, "brave"));
+        }
+
+        Builder() { // intentionally hidden
+        }
+    }
+
+    BraveServletFilter(Builder b, Brave brave) { // intentionally hidden
+        this.requestInterceptor = brave.serverRequestInterceptor();
+        this.responseInterceptor = brave.serverResponseInterceptor();
+        this.requestAdapterFactory = b.requestFactoryBuilder.build(ServletHttpServerRequest.class);
+        this.responseAdapterFactory = b.responseFactoryBuilder.build(HttpResponse.class);
+    }
+
     private final ServerRequestInterceptor requestInterceptor;
     private final ServerResponseInterceptor responseInterceptor;
-    private final SpanNameProvider spanNameProvider;
+    private final ServerRequestAdapter.Factory<ServletHttpServerRequest> requestAdapterFactory;
+    private final ServerResponseAdapter.Factory<HttpResponse> responseAdapterFactory;
 
     private FilterConfig filterConfig;
 
+    /**
+     * @deprecated please use {@link #create(Brave)} or {@link #builder()}
+     */
+    @Deprecated
     public BraveServletFilter(ServerRequestInterceptor requestInterceptor, ServerResponseInterceptor responseInterceptor, SpanNameProvider spanNameProvider) {
         this.requestInterceptor = requestInterceptor;
         this.responseInterceptor = responseInterceptor;
-        this.spanNameProvider = spanNameProvider;
+        Builder builder = builder().spanNameProvider(spanNameProvider);
+        this.requestAdapterFactory = builder.requestFactoryBuilder.build(ServletHttpServerRequest.class);
+        this.responseAdapterFactory = builder.responseFactoryBuilder.build(HttpResponse.class);
     }
 
     @Override
@@ -53,17 +113,20 @@ public class BraveServletFilter implements Filter {
         } else {
 
             final StatusExposingServletResponse statusExposingServletResponse = new StatusExposingServletResponse((HttpServletResponse) response);
-            requestInterceptor.handle(new HttpServerRequestAdapter(new ServletHttpServerRequest((HttpServletRequest) request), spanNameProvider));
-
             try {
+                ServerRequestAdapter adapter = requestAdapterFactory.create(new ServletHttpServerRequest(
+                    (HttpServletRequest) request));
+                requestInterceptor.handle(adapter);
+
                 filterChain.doFilter(request, statusExposingServletResponse);
             } finally {
-                responseInterceptor.handle(new HttpServerResponseAdapter(new HttpResponse() {
-                    @Override
-                    public int getHttpStatusCode() {
-                        return statusExposingServletResponse.getStatus();
-                    }
-                }));
+                ServerResponseAdapter adapter = responseAdapterFactory.create(new HttpResponse() {
+                        @Override
+                        public int getHttpStatusCode() {
+                            return statusExposingServletResponse.getStatus();
+                        }
+                    });
+                responseInterceptor.handle(adapter);
             }
         }
     }
